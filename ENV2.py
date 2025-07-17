@@ -2,12 +2,16 @@ import struct
 import socket
 import random
 import threading
-from time import sleep
+from time import sleep, perf_counter
 
 TM_SEND_ADDRESS = '127.0.0.1'
 TM_SEND_PORT    = 10015
 TC_LISTEN_ADDRESS = '127.0.0.1'
 TC_LISTEN_PORT    = 10025
+
+# TCP ping target for connectivity monitoring
+PING_HOST = '127.0.0.1'
+PING_PORT = 64738
 
 PACKET_ID_MAP = {
     2: "Pressurize",
@@ -24,6 +28,11 @@ airlock_pressure = PRESSURIZED_PRESSURE
 suffix_lock = threading.Lock()
 fixed_suffix = b'\x00\x00\x00\x00'  # Default: pressurized state
 
+# Network monitoring metrics
+net_lock = threading.Lock()
+net_latency = 0.0  # in seconds
+packet_loss = 0.0  # in percent
+
 def floats_to_ieee754_with_prefix_suffix(*values):
     return b''.join(struct.pack('>f', value) for value in values)
 
@@ -37,13 +46,55 @@ def Values_sim(CO2_Level, Hum_Level, Temp, Airlock_Press, Cabin_Press, Ammonia_L
     values_ENV = [CO2_Level, Hum_Level, Temp, Airlock_Press, Cabin_Press, Ammonia_Level, Air_Quality]
     with suffix_lock:
         suffix = fixed_suffix
-    byte_seq = Header(seq_count) + floats_to_ieee754_with_prefix_suffix(*values_ENV) + suffix
+    byte_seq = Header(seq_count, apid=100) + floats_to_ieee754_with_prefix_suffix(*values_ENV) + suffix
     return byte_seq
 
-def Header(seq_count):
+def Header(seq_count: int, apid: int = 100) -> bytes:
+    """Build a simple CCSDS‑like header for the given APID and sequence count."""
     if seq_count >= 16382:
         seq_count = 0
-    return  b'\x00\x64' + (49152+seq_count).to_bytes(2, 'big') +  b'\x01\x45'
+    return apid.to_bytes(2, 'big') + (49152 + seq_count).to_bytes(2, 'big') + b'\x01\x45'
+
+
+def check(host: str, port: int, timeout: float = 2) -> bool:
+    """Attempt a TCP connection to host:port within *timeout* seconds."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        try:
+            sock.connect((host, port))
+            return True
+        except (socket.timeout, OSError):
+            return False
+
+
+def timed_check(host: str, port: int, timeout: float = 2) -> float | None:
+    """Return round-trip time in seconds if reachable, otherwise None."""
+    t0 = perf_counter()
+    if check(host, port, timeout):
+        return perf_counter() - t0
+    return None
+
+
+def network_monitor(host: str, port: int, attempts: int = 4, timeout: float = 2):
+    """Continuously update latency and packet loss statistics."""
+    global net_latency, packet_loss
+    while True:
+        total = 0.0
+        errors = 0
+        for _ in range(attempts):
+            lat = timed_check(host, port, timeout)
+            if lat is None:
+                errors += 1
+            else:
+                total += lat
+            sleep(0.1)
+        success = attempts - errors
+        with net_lock:
+            if success:
+                net_latency = total / success
+            else:
+                net_latency = 0.0
+            packet_loss = (errors / attempts) * 100
 
 def tc_listener():
     global airlock_target
@@ -81,7 +132,12 @@ def main():
     t = threading.Thread(target=tc_listener, daemon=True)
     t.start()
 
-    seq_count=0
+    # Start network monitoring thread
+    net_thread = threading.Thread(target=network_monitor, args=(PING_HOST, PING_PORT), daemon=True)
+    net_thread.start()
+
+    seq_count = 0
+    net_seq_count = 0
     CO2_Level =  700
     Hum_Level = 90
     Temp =  21.5
@@ -126,6 +182,14 @@ def main():
         byte_seq = Values_sim(CO2_Level, Hum_Level, Temp, airlock_pressure, Cabin_Press, Ammonia_Level, Air_Quality, seq_count)
         tm_socket.sendto(byte_seq, (TM_SEND_ADDRESS, TM_SEND_PORT))
         seq_count += 1
+
+        # Send network metrics packet (APID 103)
+        with net_lock:
+            latency_ms = net_latency * 1000
+            loss = packet_loss
+        net_packet = Header(net_seq_count, apid=103) + floats_to_ieee754_with_prefix_suffix(latency_ms, loss)
+        tm_socket.sendto(net_packet, (TM_SEND_ADDRESS, TM_SEND_PORT))
+        net_seq_count += 1
         sleep(1/RATE)
 
 if __name__ == "__main__":
