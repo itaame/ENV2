@@ -26,11 +26,21 @@ PARABOLA_COUNT = 31
 CYCLE_DURATION = PULL_UP_DURATION + ZERO_G_DURATION + PULL_OUT_DURATION + LEVEL_DURATION
 
 # CCSDS-like header helper reused from ENV2.py
+# The CCSDS packet length field contains the total packet size minus one.
 
-def header(seq_count: int, apid: int) -> bytes:
+def header(seq_count: int, apid: int, data_len: int) -> bytes:
+    """Build a CCSDS-like primary header.
+
+    *data_len* is the size in bytes of the packet data field.  The length
+    written to the header is ``(data_len + 6) - 1`` so that the complete
+    packet occupies ``data_len + 6`` bytes.  For a 126-byte packet this value
+    becomes 125 in CCSDS units.
+    """
+
     if seq_count >= 16382:
         seq_count = 0
-    return apid.to_bytes(2, 'big') + (49152 + seq_count).to_bytes(2, 'big') + b'\x01\x45'
+    ccsds_len = data_len + 5  # (data_len + 6) - 1
+    return apid.to_bytes(2, 'big') + (49152 + seq_count).to_bytes(2, 'big') + ccsds_len.to_bytes(2, 'big')
 
 
 def floats_to_be(*values: float) -> bytes:
@@ -113,8 +123,9 @@ def simulate_all(tm_socket: socket.socket):
             float(parabola),
             *currents,
             *voltages,
+            0.0,  # padding to reach 120 data bytes (126 total)
         )
-        pkt = header(seq, apid=0x64) + data
+        pkt = header(seq, apid=0x64, data_len=len(data)) + data
         tm_socket.sendto(pkt, (TM_SEND_ADDRESS, TM_SEND_PORT))
         seq += 1
         sleep(0.1)  # 10 Hz
