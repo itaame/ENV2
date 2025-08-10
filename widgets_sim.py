@@ -7,6 +7,24 @@ from time import sleep
 TM_SEND_ADDRESS = '127.0.0.1'
 TM_SEND_PORT = 10015
 
+# ---------------------------------------------------------------------------
+# Novespace parabolic flight model
+# Durations (in seconds) roughly follow a typical Novespace profile:
+#   20 s pull‑up at ~1.8 g
+#   22 s of microgravity (0 g)
+#   20 s pull‑out at ~1.8 g
+#   40 s of level flight at ~1 g between parabolas
+# One campaign usually consists of 31 parabolas.
+# ---------------------------------------------------------------------------
+PULL_UP_DURATION = 20.0
+ZERO_G_DURATION = 22.0
+PULL_OUT_DURATION = 20.0
+LEVEL_DURATION = 40.0
+PARABOLA_COUNT = 31
+
+# Total duration of a complete parabola cycle
+CYCLE_DURATION = PULL_UP_DURATION + ZERO_G_DURATION + PULL_OUT_DURATION + LEVEL_DURATION
+
 # CCSDS-like header helper reused from ENV2.py
 
 def header(seq_count: int, apid: int) -> bytes:
@@ -19,8 +37,29 @@ def floats_to_be(*values: float) -> bytes:
     return b''.join(struct.pack('>f', v) for v in values)
 
 
+def estimate_parabola(elapsed: float) -> int:
+    """Estimate the current parabola number for a Novespace flight."""
+    parabola = int(elapsed // CYCLE_DURATION) + 1
+    return min(parabola, PARABOLA_COUNT)
+
+
+def g_profile(elapsed: float) -> float:
+    """Return the expected g level for the given elapsed time."""
+    time_in_cycle = elapsed % CYCLE_DURATION
+    if time_in_cycle < PULL_UP_DURATION:
+        return 1.8  # Pull-up
+    time_in_cycle -= PULL_UP_DURATION
+    if time_in_cycle < ZERO_G_DURATION:
+        return 0.0  # Microgravity
+    time_in_cycle -= ZERO_G_DURATION
+    if time_in_cycle < PULL_OUT_DURATION:
+        return 1.8  # Pull-out
+    return 1.0  # Level flight between parabolas
+
+
 def simulate_all(tm_socket: socket.socket):
     seq = 0
+    elapsed = 0.0
     while True:
         # --------------------------- 2 Hz sensors ---------------------------
         # T_liq from CHT8305C (>28°C amber, >30°C red)
@@ -35,12 +74,13 @@ def simulate_all(tm_socket: socket.socket):
         h2 = max(random.gauss(3000.0, 2000.0), 0.0)
 
         # --------------------------- 10 Hz sensors ---------------------------
-        # a_x/a_y/a_z from LSM6DSOX (magnitude > ±1.5 g red)
+        # a_x/a_y/a_z from LSM6DSOX during parabolic flight
+        g_level = g_profile(elapsed)
         ax = random.gauss(0.0, 0.02)
         ay = random.gauss(0.0, 0.02)
-        az = random.gauss(1.0, 0.02)  # approx 1g on Z
+        az = random.gauss(g_level, 0.02)
 
-        # Derive normalised gravity vector (gx, gy, gz)
+        # Derive normalised gravity vector (gx, gy, gz) and total g-force
         mag = math.sqrt(ax * ax + ay * ay + az * az)
         if mag == 0:
             gx = gy = gz = 0.0
@@ -48,6 +88,8 @@ def simulate_all(tm_socket: socket.socket):
             gx = ax / mag
             gy = ay / mag
             gz = az / mag
+        g_force = mag
+        parabola = estimate_parabola(elapsed)
 
         # Currents I_E1-E4, I_C1-C4 from INA219 (limit 2.2 A red)
         currents = [max(random.gauss(1.0, 0.8), 0.0) for _ in range(8)]
@@ -67,6 +109,8 @@ def simulate_all(tm_socket: socket.socket):
             gx,
             gy,
             gz,
+            g_force,
+            float(parabola),
             *currents,
             *voltages,
         )
@@ -74,6 +118,7 @@ def simulate_all(tm_socket: socket.socket):
         tm_socket.sendto(pkt, (TM_SEND_ADDRESS, TM_SEND_PORT))
         seq += 1
         sleep(0.1)  # 10 Hz
+        elapsed += 0.1
 
 
 def main():
