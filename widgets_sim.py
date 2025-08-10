@@ -2,7 +2,6 @@ import struct
 import socket
 import random
 import math
-import threading
 from time import sleep
 
 TM_SEND_ADDRESS = '127.0.0.1'
@@ -20,12 +19,10 @@ def floats_to_be(*values: float) -> bytes:
     return b''.join(struct.pack('>f', v) for v in values)
 
 
-# --------------------------- 2 Hz sensors ---------------------------
-
-def simulate_2hz(tm_socket: socket.socket):
+def simulate_all(tm_socket: socket.socket):
     seq = 0
     while True:
-        # Generate values
+        # --------------------------- 2 Hz sensors ---------------------------
         # T_liq from CHT8305C (>28°C amber, >30°C red)
         t_liq = random.gauss(26.0, 2.0)
         # p_box from BME280 (<0.80 bar or >1.05 bar red)
@@ -37,19 +34,7 @@ def simulate_2hz(tm_socket: socket.socket):
         # H2 from MQ-8 (>4000 ppm amber; >10000 ppm red)
         h2 = max(random.gauss(3000.0, 2000.0), 0.0)
 
-        # Pack floats into a single telemetry packet (APID 200)
-        data = floats_to_be(t_liq, p_box, rh_box, t_box, h2)
-        pkt = header(seq, apid=200) + data
-        tm_socket.sendto(pkt, (TM_SEND_ADDRESS, TM_SEND_PORT))
-        seq += 1
-        sleep(0.5)  # 2 Hz
-
-
-# --------------------------- 10 Hz sensors ---------------------------
-
-def simulate_10hz(tm_socket: socket.socket):
-    seq = 0
-    while True:
+        # --------------------------- 10 Hz sensors ---------------------------
         # a_x/a_y/a_z from LSM6DSOX (magnitude > ±1.5 g red)
         ax = random.gauss(0.0, 0.02)
         ay = random.gauss(0.0, 0.02)
@@ -69,8 +54,23 @@ def simulate_10hz(tm_socket: socket.socket):
         # Voltages V_E1-E4, V_C1-C4 from INA219 (limit 40 V red)
         voltages = [max(random.gauss(28.0, 10.0), 0.0) for _ in range(8)]
 
-        data = floats_to_be(ax, ay, az, gx, gy, gz, *currents, *voltages)
-        pkt = header(seq, apid=201) + data
+        # Pack everything into a single telemetry packet (APID 0x64 = 100 decimal)
+        data = floats_to_be(
+            t_liq,
+            p_box,
+            rh_box,
+            t_box,
+            h2,
+            ax,
+            ay,
+            az,
+            gx,
+            gy,
+            gz,
+            *currents,
+            *voltages,
+        )
+        pkt = header(seq, apid=0x64) + data
         tm_socket.sendto(pkt, (TM_SEND_ADDRESS, TM_SEND_PORT))
         seq += 1
         sleep(0.1)  # 10 Hz
@@ -78,16 +78,8 @@ def simulate_10hz(tm_socket: socket.socket):
 
 def main():
     tm_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-    t1 = threading.Thread(target=simulate_2hz, args=(tm_socket,), daemon=True)
-    t2 = threading.Thread(target=simulate_10hz, args=(tm_socket,), daemon=True)
-    t1.start()
-    t2.start()
-
-    # Keep main thread alive
     try:
-        while True:
-            sleep(1)
+        simulate_all(tm_socket)
     except KeyboardInterrupt:
         pass
 
